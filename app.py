@@ -52,7 +52,6 @@ def debug_log(message):
     if st.session_state.get('debug_mode', False):
         st.write(f"[DEBUG] {message}")
 
-# 改进的背景检测
 def detect_background_color(img, custom_bg=None):
     try:
         if custom_bg is not None:
@@ -77,45 +76,51 @@ def detect_background_color(img, custom_bg=None):
     except:
         return (255, 255, 255)
 
-def safe_resize(image, target_size):
-    """带尺寸校验的缩放"""
-    if image.size == 0:
-        return None
-    try:
-        return cv2.resize(image, target_size, interpolation=cv2.INTER_AREA)
-    except Exception as e:
-        debug_log(f"缩放失败: {str(e)}")
-        return None
-
 def calculate_head_position(face_box, img):
-    """带异常保护的头部定位"""
-    try:
-        (startX, startY, endX, endY) = face_box
-        face_h = endY - startY
-        
-        # 计算检测区域
-        roi_top = max(0, startY - int(face_h * 1.2))
-        roi = img[roi_top:startY, startX:endX]
-        
-        if roi.size == 0:
-            return startY - int(face_h * 0.25)
-        
-        # 边缘检测优化
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        edges = cv2.Canny(gray, 50, 150)
-        kernel = np.ones((3,3), np.uint8)
-        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
-        
-        # 寻找有效边缘
-        edge_rows = np.where(edges > 0)[0]
-        if len(edge_rows) > 0:
-            return roi_top + edge_rows[0]
-        return startY - int(face_h * 0.25)
-    except Exception as e:
-        debug_log(f"头部定位异常: {str(e)}")
-        return startY  # 安全回退到面部顶部
+    """估算头部顶部位置"""
+    (startX, startY, endX, endY) = face_box
+    face_height = endY - startY
+    
+    # 在面部区域上方提取ROI进行边缘检测
+    roi_y1 = max(0, startY - int(face_height * 1.5))
+    roi = img[roi_y1:startY, startX:endX]
+    
+    # 灰度转换和边缘检测
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    
+    # 寻找最上方的连续边缘
+    edge_rows = np.where(edges > 0)[0]
+    if len(edge_rows) > 0:
+        head_top_rel = edge_rows[0]
+        return roi_y1 + head_top_rel
+    else:
+        return startY - int(face_height * 0.3)  # 默认估计
 
-# 修改后的核心处理函数
+def smart_crop(img):
+    """智能裁剪核心逻辑"""
+    (h, w) = img.shape[:2]
+    
+    # 人脸检测
+    blob = cv2.dnn.blobFromImage(cv2.resize(img, (300, 300)), 1.0,
+                               (300, 300), (104.0, 177.0, 123.0))
+    net.setInput(blob)
+    detections = net.forward()
+
+    # 选择最佳人脸
+    best_conf = 0
+    best_box = None
+    for i in range(detections.shape[2]):
+        confidence = detections[0, 0, i, 2]
+        if confidence > 0.9 and confidence > best_conf:
+            box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+            best_box = box.astype("int")
+            best_conf = confidence
+
+    if best_box is None:
+        return None
+
+   # 修改后的核心处理函数
 def process_image_file(input_path, output_path, target_size, head_margin, bg_mode):
     try:
         img = cv2.imread(input_path)
@@ -147,7 +152,23 @@ def process_image_file(input_path, output_path, target_size, head_margin, bg_mod
 
         if best_box is None:
             debug_log(f"未检测到人脸: {input_path}")
-            result = cv2.resize(img, (target_w, target_h))
+            # 保持宽高比缩放原图并添加背景
+            h_img, w_img = img.shape[:2]
+            target_aspect = target_w / target_h
+            current_aspect = w_img / h_img
+
+            if current_aspect > target_aspect:
+                new_w = target_w
+                new_h = int(h_img * (target_w / w_img))
+            else:
+                new_h = target_h
+                new_w = int(w_img * (target_h / h_img))
+            
+            resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            result = np.full((target_h, target_w, 3), bg_color, dtype=np.uint8)
+            x_offset = (target_w - new_w) // 2
+            y_offset = (target_h - new_h) // 2
+            result[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = resized
         else:
             (startX, startY, endX, endY) = best_box
             head_top = calculate_head_position(best_box, img)
@@ -157,20 +178,31 @@ def process_image_file(input_path, output_path, target_size, head_margin, bg_mod
             required_height = int(target_h * (w / target_w))
             crop_bottom = min(h, crop_top + required_height)
             
-            # 边界处理
+            # 边界处理：扩展底部背景
             if crop_bottom > h:
                 img = cv2.copyMakeBorder(img, 0, crop_bottom-h, 0, 0,
                                        cv2.BORDER_CONSTANT, value=bg_color)
+                h = crop_bottom  # 更新图片高度
             
             cropped = img[crop_top:crop_bottom, :]
             
-            # 最终合成
-            resized = safe_resize(cropped, (target_w, target_h))
-            if resized is None:
-                resized = cv2.resize(img, (target_w, target_h))
+            # 保持宽高比缩放并添加背景
+            h_cropped, w_cropped = cropped.shape[:2]
+            target_aspect = target_w / target_h
+            current_aspect = w_cropped / h_cropped
+
+            if current_aspect > target_aspect:
+                new_w = target_w
+                new_h = int(h_cropped * (target_w / w_cropped))
+            else:
+                new_h = target_h
+                new_w = int(w_cropped * (target_h / h_cropped))
             
+            resized = cv2.resize(cropped, (new_w, new_h), interpolation=cv2.INTER_AREA)
             result = np.full((target_h, target_w, 3), bg_color, dtype=np.uint8)
-            result = cv2.addWeighted(result, 0, resized, 1, 0)
+            x_offset = (target_w - new_w) // 2
+            y_offset = (target_h - new_h) // 2
+            result[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = resized
 
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         cv2.imwrite(output_path, result)
@@ -178,17 +210,32 @@ def process_image_file(input_path, output_path, target_size, head_margin, bg_mod
     except Exception as e:
         return False, str(e)
 
-# 修改后的主处理函数
 def process_zip(uploaded_zip, target_size, head_margin, bg_mode):
     with tempfile.TemporaryDirectory() as tmp_in:
-        # 解压上传的ZIP
-        with zipfile.ZipFile(uploaded_zip) as zf:
-            zf.extractall(tmp_in)
-        
+        # 解压上传的ZIP并处理文件名编码
+        zf = zipfile.ZipFile(uploaded_zip)
+        for file_info in zf.infolist():
+            # 解码文件名
+            try:
+                decoded_name = file_info.filename.encode('cp437').decode('utf-8')
+            except UnicodeDecodeError:
+                try:
+                    decoded_name = file_info.filename.encode('cp437').decode('gbk')
+                except:
+                    decoded_name = file_info.filename  # 保留原始名称
+            
+            target_path = os.path.join(tmp_in, decoded_name)
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+            
+            if not file_info.is_dir():
+                with open(target_path, 'wb') as f:
+                    f.write(zf.read(file_info))
+
         results = {'total':0, 'success':0, 'errors':[]}
         output_buffer = io.BytesIO()
         
-        with zipfile.ZipFile(output_buffer, 'w') as output_zip:
+        # 创建支持UTF-8编码的ZIP文件
+        with zipfile.ZipFile(output_buffer, 'w', compression=zipfile.ZIP_DEFLATED) as output_zip:
             for root, _, files in os.walk(tmp_in):
                 for filename in files:
                     if filename.lower().split('.')[-1] not in ['jpg', 'jpeg', 'png']:
@@ -209,7 +256,12 @@ def process_zip(uploaded_zip, target_size, head_margin, bg_mode):
                         )
                         
                         if success:
-                            output_zip.write(output_path, arcname=relative_path)
+                            # 添加文件到ZIP并确保UTF-8编码
+                            zip_info = zipfile.ZipInfo(relative_path)
+                            zip_info.flag_bits |= 0x800  # 设置UTF-8标志位
+                            with open(output_path, 'rb') as f:
+                                data = f.read()
+                            output_zip.writestr(zip_info, data)
                             results['success'] += 1
                         else:
                             error_msg = f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {relative_path}: {message}"
@@ -220,8 +272,8 @@ def process_zip(uploaded_zip, target_size, head_margin, bg_mode):
         return results, output_buffer
 
 # Streamlit界面
-st.title("📁 智能证件照批量处理系统")
-st.checkbox("调试模式", key='debug_mode')
+st.title("📸 智能证件照处理系统")
+st.markdown("自动生成1200×1500证件照，包含蓝色背景")
 
 uploaded_zip = st.file_uploader("上传ZIP压缩包", type=["zip"])
 
