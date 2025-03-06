@@ -16,6 +16,9 @@ BatchID Engine is an intelligent batch processing system for standardized ID pho
 
 ## 🎯 Features
 
+### Demo:<a href="[https://htmlpreview.github.io/?https://raw.githubusercontent.com/987153776/vue-picture-cut/master/dist/index.html](https://batchid-engine.streamlit.app)" target="_blank">🔗Demo ONLINE(streamlit)</a>
+
+
 ### 1. Intelligent Batch Processing
 - Process nested ZIP archives (max 500MB)
 - Preserve original folder structure
